@@ -283,6 +283,862 @@
     const CONFIG = {
       // Google Sheet CSV endpoint (example placeholder). Replace with user's published CSV URL if desired.
       // Expected CSV columns: title,date,description,fee
+      sheetCsv: "https://docs.google.com/spreadsheets/d/e/2PACX-1vR9sYOi5ufLQN--VhNROSY9j6DcfBWAi4XhqLeLHYCvA9nTvxYQ8JwiirZ2p1e7Dsf29LqdVSkaoDqq/pub?gid=0&single=true&output=csv",
+      // local fallback config used if CSV fetch fails
+      fallbackEvents: [
+        { title: "Sreejan Sandhani Annual Match", date: "2025-11-15", description: "Community health camp and fair", fee: 5000 },
+        { title: "Fundraiser Concert", date: "2025-12-05", description: "Live music and food stalls", fee: 8000 },
+        { title: "Drawing Competition", date: "2026-01-10", description: "Students' drawing exhibition", fee: 2000 }
+      ],
+      // Pricing rates (₹ per sq.inch)
+      drawing: { premiumRate: 12.0, standardRate: 8.0 }, // front/back
+      bagRate: 6.0,
+      // banner placements
+      banners: {
+        "Main Stage": { base: 2000, multiplier: 1.5 },
+        "Road Side": { base: 800, multiplier: 1.0 },
+        "Food Court": { base: 1200, multiplier: 1.2 },
+        "Entrance": { base: 1500, multiplier: 1.3 }
+      },
+      promoCodes: {
+        "SANDHANI10": { percent: 10 }
+      },
+      // hardcoded login-only internal users
+      internalUsers: [
+        { email: "founder@ss.com", pass: "admin", role: "founder", name: "Founder" },
+        { email: "manager@ss.com", pass: "admin", role: "manager", name: "Manager" },
+        { email: "volunteer@ss.com", pass: "admin", role: "volunteer", name: "Volunteer" }
+      ],
+      // sample initial sponsors (if none in localStorage)
+      sampleSponsors: [
+        { id: "s1", name: "Local Grocers", logo: "", url: "", clicks: 0, revenue: 0, metrics: {} },
+        { id: "s2", name: "BookWorld", logo: "", url: "", clicks: 0, revenue: 0, metrics: {} }
+      ]
+    };
+
+    /* -------------------------
+       Utilities & localStorage helpers
+       ------------------------- */
+    function lsGet(key, fallback) {
+      try {
+        const v = localStorage.getItem(key);
+        return v ? JSON.parse(v) : fallback;
+      } catch (e) {
+        return fallback;
+      }
+    }
+    function lsSet(key, value) {
+      localStorage.setItem(key, JSON.stringify(value));
+    }
+    function uid(prefix="id") {
+      return prefix + "_" + Math.random().toString(36).slice(2,9);
+    }
+
+    /* -------------------------
+       App State
+       ------------------------- */
+    const State = {
+      configEvents: [], // loaded from CSV or fallback
+      currentUser: lsGet("ss_currentUser", null), // {email,role,name}
+      sponsors: lsGet("ss_sponsors", null) || CONFIG.sampleSponsors,
+      enrollments: lsGet("ss_enrollments", []) // array of saved enrollments
+    };
+    lsSet("ss_sponsors", State.sponsors); // ensure stored if using fallback
+
+    /* -------------------------
+       Load Config Events (CSV fetch)
+       - Fetch a CSV, parse minimal columns: title,date,description,fee
+       - If fetch fails, use fallbackEvents
+       ------------------------- */
+    async function loadConfig() {
+      const out = [];
+      try {
+        const res = await fetch(CONFIG.sheetCsv, {cache: "no-store"});
+        if (!res.ok) throw new Error("bad");
+        const csv = await res.text();
+        // basic CSV parse - split lines, handle commas in quotes lightly
+        const lines = csv.trim().split(/\r?\n/).filter(Boolean);
+        const headers = lines.shift().split(",").map(s=>s.trim().toLowerCase());
+        for (const line of lines) {
+          const cols = line.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(s=>s.replace(/^"|"$/g,"").trim());
+          const obj = {};
+          headers.forEach((h,i)=> obj[h] = cols[i] || "");
+          out.push({
+            title: obj.title || "Untitled Event",
+            date: obj.date || "",
+            description: obj.description || "",
+            fee: Number(obj.fee) || 0
+          });
+        }
+        if (out.length === 0) throw new Error("empty");
+        State.configEvents = out;
+        document.getElementById("cfg-last-updated").textContent = "Config: loaded from sheet";
+      } catch (e) {
+        State.configEvents = CONFIG.fallbackEvents;
+        document.getElementById("cfg-last-updated").textContent = "Config: using fallback (CSV load failed)";
+      }
+      renderEvents();
+    }
+
+    /* -------------------------
+       Render Events
+       ------------------------- */
+    function renderEvents() {
+      const container = document.getElementById("events");
+      container.innerHTML = "";
+      State.configEvents.forEach(ev => {
+        const card = document.createElement("div");
+        card.className = "bg-white p-4 rounded shadow-sm";
+        card.innerHTML = `
+          <div class="flex items-start justify-between">
+            <div>
+              <div class="font-semibold">${escapeHtml(ev.title)}</div>
+              <div class="text-xs text-gray-500">${escapeHtml(ev.date)}</div>
+              <div class="text-sm mt-2">${escapeHtml(ev.description)}</div>
+            </div>
+            <div class="text-right">
+              <div class="text-indigo-600 font-semibold">₹${Number(ev.fee).toLocaleString()}</div>
+              <div class="text-xs text-gray-500">Event Fee</div>
+            </div>
+          </div>
+        `;
+        container.appendChild(card);
+      });
+    }
+
+    /* -------------------------
+       Render Sponsors Grid
+       ------------------------- */
+    function renderSponsors() {
+      const grid = document.getElementById("sponsor-grid");
+      grid.innerHTML = "";
+      State.sponsors.forEach(s => {
+        const el = document.createElement("div");
+        el.className = "bg-white p-3 rounded shadow-sm flex flex-col items-center text-center";
+        const logoHtml = s.logo ? `<img src="${escapeAttr(s.logo)}" alt="${escapeAttr(s.name)}" class="h-16 object-contain mb-2" />` : `<div class="h-16 w-32 bg-gray-100 flex items-center justify-center mb-2 rounded text-xs text-gray-500">No Logo</div>`;
+        el.innerHTML = `
+          <div class="w-full">${logoHtml}</div>
+          <div class="font-semibold text-sm">${escapeHtml(s.name)}</div>
+          <div class="text-xs text-gray-500 mt-1">Clicks: <span class="s-clicks">${s.clicks||0}</span></div>
+          <div class="mt-3 w-full">
+            <button class="btn-visit bg-indigo-600 text-white px-3 py-1 rounded w-full">Visit / Click</button>
+          </div>
+        `;
+        const btn = el.querySelector(".btn-visit");
+        btn.addEventListener("click", ()=>{
+          s.clicks = (s.clicks||0)+1;
+          lsSet("ss_sponsors", State.sponsors);
+          renderSponsors();
+          // if sponsor has URL, open in new tab
+          if (s.url) window.open(s.url, "_blank");
+        });
+        grid.appendChild(el);
+      });
+    }
+
+    /* -------------------------
+       Authentication & Users
+       - Unified Login/Signup modal
+       - Sign Up allowed only for participant/sponsor
+       - Internal roles login-only
+       ------------------------- */
+    function initAuthUI() {
+      const btnLogin = document.getElementById("btn-login");
+      const modal = document.getElementById("modal-auth");
+      const close = document.getElementById("close-auth");
+      const actionBtn = document.getElementById("auth-action");
+      const guestBtn = document.getElementById("auth-guest");
+      const roleSel = document.getElementById("auth-role");
+      const emailInput = document.getElementById("auth-email");
+      const passInput = document.getElementById("auth-pass");
+      const msg = document.getElementById("auth-msg");
+
+      btnLogin.addEventListener("click", ()=>{ modal.classList.remove("hidden"); modal.classList.add("flex"); msg.textContent = ""; });
+      close.addEventListener("click", ()=>{ modal.classList.add("hidden"); modal.classList.remove("flex"); });
+      guestBtn.addEventListener("click", ()=>{ State.currentUser = null; lsSet("ss_currentUser", null); updateAuthUI(); modal.classList.add("hidden"); });
+
+      actionBtn.addEventListener("click", ()=>{
+        msg.textContent = "";
+        const email = (emailInput.value||"").trim().toLowerCase();
+        const pass = passInput.value||"";
+        const role = roleSel.value;
+
+        // internal users: login-only
+        const internal = CONFIG.internalUsers.find(u=>u.email===email);
+        if (internal) {
+          if (internal.pass === pass && internal.role === role) {
+            State.currentUser = { email: internal.email, role: internal.role, name: internal.name };
+            lsSet("ss_currentUser", State.currentUser);
+            updateAuthUI();
+            modal.classList.add("hidden");
+            return;
+          } else {
+            msg.textContent = "Invalid internal credentials for selected role.";
+            return;
+          }
+        }
+
+        // Sign up restrictions: allow only participant or sponsor
+        if (!email || !pass) { msg.textContent = "Please provide email and password."; return; }
+
+        if (role !== "participant" && role !== "sponsor") {
+          msg.textContent = "Sign Up only allowed for Participant or Sponsor. Internal roles are login-only.";
+          return;
+        }
+
+        // create user in localStorage users list (simple)
+        const users = lsGet("ss_users", []);
+        const existing = users.find(u=>u.email===email);
+        if (existing) {
+          // login path for existing non-internal user
+          if (existing.pass === pass && existing.role === role) {
+            State.currentUser = { email: existing.email, role: existing.role, name: existing.name||existing.email.split("@")[0] };
+            lsSet("ss_currentUser", State.currentUser);
+            updateAuthUI();
+            modal.classList.add("hidden");
+            return;
+          } else {
+            msg.textContent = "Email already registered. Check credentials or choose different email.";
+            return;
+          }
+        }
+
+        // register new user
+        const newUser = { id: uid("u"), email, pass, role, name: email.split("@")[0] };
+        users.push(newUser);
+        lsSet("ss_users", users);
+        State.currentUser = { email: newUser.email, role: newUser.role, name: newUser.name };
+        lsSet("ss_currentUser", State.currentUser);
+        updateAuthUI();
+        modal.classList.add("hidden");
+      });
+    }
+
+    /* -------------------------
+       Update Auth UI: show current user and admin toggles
+       ------------------------- */
+    function updateAuthUI() {
+      const btnLogin = document.getElementById("btn-login");
+      const btnEnroll = document.getElementById("btn-enroll");
+      const adminArea = document.getElementById("admin-area");
+
+      if (State.currentUser) {
+        btnLogin.textContent = `${State.currentUser.name} · ${State.currentUser.role}`;
+        btnLogin.classList.add("bg-gray-100","border-gray-300","text-gray-700");
+        btnEnroll.classList.remove("hidden");
+      } else {
+        btnLogin.textContent = `Login / Signup`;
+        btnLogin.classList.remove("bg-gray-100","border-gray-300","text-gray-700");
+        btnEnroll.classList.add("hidden");
+      }
+
+      // Admin mode: only founder or manager show admin UI option
+      if (State.currentUser && (State.currentUser.role === "founder" || State.currentUser.role === "manager")) {
+        adminArea.classList.remove("hidden");
+        initAdminControls();
+      } else {
+        adminArea.classList.add("hidden");
+      }
+    }
+
+    /* -------------------------
+       Enrollment / Ad Configurator Logic
+       - Manage toggles, live calculation, promo application
+       - Save enrollment locally and update sponsors if sponsor chooses
+       ------------------------- */
+    function initEnrollUI() {
+      const btnEnroll = document.getElementById("btn-enroll");
+      const modal = document.getElementById("modal-enroll");
+      const close = document.getElementById("close-enroll");
+      const dbEnabled = document.getElementById("db-enabled");
+      const bagEnabled = document.getElementById("bag-enabled");
+      const bannerEnabled = document.getElementById("banner-enabled");
+
+      const dbSection = document.getElementById("db-section");
+      const bagSection = document.getElementById("bag-section");
+      const bannerSection = document.getElementById("banner-section");
+
+      const dbSpace = document.getElementById("db-space");
+      const dbQty = document.getElementById("db-qty");
+      const dbSide = document.getElementById("db-side");
+
+      const bagSpace = document.getElementById("bag-space");
+      const bagQty = document.getElementById("bag-qty");
+
+      const bannerPlace = document.getElementById("banner-place");
+      const bannerQty = document.getElementById("banner-qty");
+
+      const promo = document.getElementById("promo");
+      const promoMsg = document.getElementById("promo-msg");
+
+      const sumDb = document.getElementById("sum-db");
+      const sumBag = document.getElementById("sum-bag");
+      const sumBanner = document.getElementById("sum-banner");
+      const sumSub = document.getElementById("sum-sub");
+      const sumDiscount = document.getElementById("sum-discount");
+      const sumTotal = document.getElementById("sum-total");
+
+      const confirm = document.getElementById("confirm-enroll");
+      const previewBtn = document.getElementById("preview-sponsor");
+      const previewModal = document.getElementById("modal-preview");
+      const previewContent = document.getElementById("preview-content");
+      const closePreview = document.getElementById("close-preview");
+
+      // populate banner placements
+      bannerPlace.innerHTML = "";
+      Object.keys(CONFIG.banners).forEach(k=>{
+        const opt = document.createElement("option");
+        opt.value = k;
+        opt.textContent = `${k} — Base ₹${CONFIG.banners[k].base} ×${CONFIG.banners[k].multiplier}`;
+        bannerPlace.appendChild(opt);
+      });
+
+      // show/hide sections by toggles
+      dbEnabled.addEventListener("change", ()=> toggleSection(dbEnabled, dbSection));
+      bagEnabled.addEventListener("change", ()=> toggleSection(bagEnabled, bagSection));
+      bannerEnabled.addEventListener("change", ()=> toggleSection(bannerEnabled, bannerSection));
+      function toggleSection(cb, section) {
+        if (cb.checked) section.classList.remove("hidden"); else section.classList.add("hidden");
+        recalcAll();
+      }
+
+      // compute price functions
+      function calcDrawing() {
+        if (!dbEnabled.checked) return 0;
+        const space = Number(dbSpace.value) || 0;
+        const qty = Number(dbQty.value) || 0;
+        if (!space || !qty) return 0;
+        const side = dbSide.value;
+        const rate = (side === "front") ? CONFIG.drawing.premiumRate : CONFIG.drawing.standardRate;
+        return +(space * qty * rate);
+      }
+      function calcBags() {
+        if (!bagEnabled.checked) return 0;
+        const space = Number(bagSpace.value) || 0;
+        const qty = Number(bagQty.value) || 0;
+        if (!space || !qty) return 0;
+        return +(space * qty * CONFIG.bagRate);
+      }
+      function calcBanners() {
+        if (!bannerEnabled.checked) return 0;
+        const place = bannerPlace.value;
+        const qty = Number(bannerQty.value) || 0;
+        if (!place || !qty) return 0;
+        const p = CONFIG.banners[place];
+        if (!p) return 0;
+        return +(p.base * p.multiplier * qty);
+      }
+
+      function recalcAll() {
+        const db = calcDrawing();
+        const bag = calcBags();
+        const ban = calcBanners();
+        const sub = +(db + bag + ban);
+        const promoCode = (promo.value||"").trim().toUpperCase();
+        let discount = 0;
+        if (promoCode && CONFIG.promoCodes[promoCode]) {
+          discount = +(sub * (CONFIG.promoCodes[promoCode].percent/100));
+          promoMsg.textContent = `Promo ${promoCode} applied: ${CONFIG.promoCodes[promoCode].percent}%`;
+        } else {
+          promoMsg.textContent = promoCode ? "Invalid promo code" : "";
+        }
+        const total = +(sub - discount);
+        sumDb.textContent = `₹${db.toLocaleString()}`;
+        sumBag.textContent = `₹${bag.toLocaleString()}`;
+        sumBanner.textContent = `₹${ban.toLocaleString()}`;
+        sumSub.textContent = `₹${sub.toLocaleString()}`;
+        sumDiscount.textContent = `-₹${discount.toLocaleString()}`;
+        sumTotal.textContent = `₹${total.toLocaleString()}`;
+        // return structured result
+        return { db, bag, ban, sub, discount, total, promoCode };
+      }
+
+      // live recalc on change
+      ["input","change"].forEach(ev=>{
+        [dbSpace, dbQty, dbSide, bagSpace, bagQty, bannerPlace, bannerQty, promo].forEach(inp=>{
+          inp.addEventListener(ev, recalcAll);
+        });
+      });
+
+      // open/close
+      btnEnroll.addEventListener("click", ()=>{
+        if (!State.currentUser) {
+          alert("Please log in or sign up to enroll as Sponsor/Participant.");
+          return;
+        }
+        document.getElementById("enroll-msg").textContent = "";
+        modal.classList.remove("hidden"); modal.classList.add("flex");
+        recalcAll();
+      });
+      close.addEventListener("click", ()=>{ modal.classList.add("hidden"); modal.classList.remove("flex"); });
+
+      // preview
+      previewBtn.addEventListener("click", ()=>{
+        const sums = recalcAll();
+        const sName = document.getElementById("sname").value || "Unnamed Sponsor";
+        const sLogo = document.getElementById("slogo").value || "";
+        const sUrl = document.getElementById("surl").value || "";
+        previewContent.innerHTML = `
+          <div class="text-sm">
+            <div class="font-semibold">${escapeHtml(sName)}</div>
+            <div class="text-xs text-gray-500 mt-1">Website: ${escapeHtml(sUrl)}</div>
+            <div class="mt-2">Drawing Books: ₹${sums.db.toLocaleString()}</div>
+            <div>Bags: ₹${sums.bag.toLocaleString()}</div>
+            <div>Banners: ₹${sums.ban.toLocaleString()}</div>
+            <div class="mt-2 font-semibold">Total: ₹${sums.total.toLocaleString()}</div>
+          </div>
+        `;
+        previewModal.classList.remove("hidden"); previewModal.classList.add("flex");
+      });
+      closePreview.addEventListener("click", ()=>{ previewModal.classList.add("hidden"); previewModal.classList.remove("flex"); });
+
+      // confirm enroll -> save locally
+      confirm.addEventListener("click", ()=>{
+        const sums = recalcAll();
+        const sponsorName = document.getElementById("sname").value.trim();
+        if (!sponsorName) { document.getElementById("enroll-msg").textContent = "Please provide Sponsor Name."; return; }
+        const sponsor = {
+          id: uid("s"),
+          name: sponsorName,
+          logo: document.getElementById("slogo").value.trim(),
+          url: document.getElementById("surl").value.trim(),
+          clicks: 0,
+          revenue: sums.total,
+          metrics: {}
+        };
+        // push to sponsors & enrollments
+        State.sponsors.push(sponsor);
+        lsSet("ss_sponsors", State.sponsors);
+
+        const enrollment = {
+          id: uid("e"),
+          sponsorId: sponsor.id,
+          sponsorName: sponsor.name,
+          createdBy: State.currentUser ? State.currentUser.email : "guest",
+          createdAt: new Date().toISOString(),
+          items: {
+            drawing: dbEnabled.checked ? { space: Number(dbSpace.value||0), qty: Number(dbQty.value||0), side: dbSide.value } : null,
+            bag: bagEnabled.checked ? { space: Number(bagSpace.value||0), qty: Number(bagQty.value||0) } : null,
+            banner: bannerEnabled.checked ? { place: bannerPlace.value, qty: Number(bannerQty.value||0) } : null
+          },
+          pricing: { subtotal: sums.sub, discount: sums.discount, total: sums.total, promo: sums.promoCode }
+        };
+        State.enrollments.push(enrollment);
+        lsSet("ss_enrollments", State.enrollments);
+
+        // feedback & UI update
+        document.getElementById("enroll-msg").textContent = `Enrollment saved locally. Sponsor ID: ${sponsor.id}`;
+        renderSponsors();
+        renderSponsorTracking();
+      });
+
+      // initialize display values
+      recalcAll();
+    }
+
+    /* -------------------------
+       Admin Controls
+       ------------------------- */
+    function initAdminControls() {
+      const feeInput = document.getElementById("event-fee");
+      const saveFee = document.getElementById("save-fee");
+      const resetCfg = document.getElementById("reset-cfg");
+      const refreshLog = document.getElementById("refresh-log");
+      const clearLocal = document.getElementById("clear-local");
+      const localLog = document.getElementById("local-log");
+
+      // prefill fee from first event or 0
+      const currentFee = (State.configEvents[0] && Number(State.configEvents[0].fee)) || 0;
+      feeInput.value = currentFee;
+
+      saveFee.onclick = ()=>{
+        // only Founder allowed to "save" config changes (simulated), manager cannot
+        if (!State.currentUser || State.currentUser.role !== "founder") {
+          alert("Only Founders can update Event Fee (simulated).");
+          return;
+        }
+        const newFee = Number(feeInput.value) || 0;
+        // mutate our in-memory config events (simulating manual config update)
+        if (!State.configEvents[0]) State.configEvents[0] = {};
+        State.configEvents[0].fee = newFee;
+        // persist a simulated config update locally
+        lsSet("ss_config_override", { updatedAt: new Date().toISOString(), fee: newFee });
+        alert("Event Fee updated locally (simulation).");
+        renderEvents();
+      };
+
+      resetCfg.onclick = async ()=>{
+        await loadConfig();
+        feeInput.value = (State.configEvents[0] && Number(State.configEvents[0].fee)) || 0;
+      };
+
+      // sponsor tracking view
+      refreshLog.onclick = ()=> showLocalLog();
+      clearLocal.onclick = ()=> {
+        if (!confirm("Clear ALL localStorage for this origin? This will remove users, sponsors, enrollments, and overrides.")) return;
+        localStorage.clear();
+        // reset app state and reinit
+        State.sponsors = CONFIG.sampleSponsors.slice();
+        State.enrollments = [];
+        State.currentUser = null;
+        lsSet("ss_sponsors", State.sponsors);
+        lsSet("ss_enrollments", []);
+        lsSet("ss_currentUser", null);
+        alert("localStorage cleared. App reset. Please reload the page.");
+        location.reload();
+      };
+      showLocalLog();
+
+      // render sponsor tracking table
+      renderSponsorTracking();
+    }
+
+    function renderSponsorTracking() {
+      const container = document.getElementById("sponsor-tracking");
+      container.innerHTML = "";
+      const list = State.sponsors.slice().map(s=>{
+        return `<div class="border rounded p-2 mb-2">
+          <div class="flex items-center justify-between">
+            <div>
+              <div class="font-semibold">${escapeHtml(s.name)}</div>
+              <div class="text-xs text-gray-500">Clicks: ${Number(s.clicks||0)} · Revenue: ₹${Number(s.revenue||0).toLocaleString()}</div>
+            </div>
+            <div class="text-right">
+              <input data-id="${s.id}" placeholder="Banner Views (num)" class="metric-input border px-2 py-1 rounded text-sm w-28" />
+              <button data-id="${s.id}" class="metric-save ml-2 bg-indigo-600 text-white px-2 py-1 rounded text-sm">Save</button>
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+      container.innerHTML = list;
+      // attach events for metric save
+      container.querySelectorAll(".metric-save").forEach(btn=>{
+        btn.addEventListener("click", (e)=>{
+          const id = e.target.getAttribute("data-id");
+          const input = container.querySelector(`.metric-input[data-id="${id}"]`);
+          const val = Number(input.value||0);
+          const s = State.sponsors.find(x=>x.id===id);
+          if (s) {
+            s.metrics.bannerViews = val;
+            lsSet("ss_sponsors", State.sponsors);
+            renderSponsorTracking();
+            alert("Metric saved locally.");
+          }
+        });
+      });
+    }
+
+    function showLocalLog() {
+      const localLog = document.getElementById("local-log");
+      const dump = {};
+      for (let i=0;i<localStorage.length;i++){
+        const key = localStorage.key(i);
+        try { dump[key] = JSON.parse(localStorage.getItem(key)); } catch(e) { dump[key] = localStorage.getItem(key); }
+      }
+      localLog.textContent = JSON.stringify(dump, null, 2);
+    }
+
+    /* -------------------------
+       Helpers: escaping to avoid injection
+       ------------------------- */
+    function escapeHtml(s){ if (!s && s!==0) return ""; return String(s).replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]); }); }
+    function escapeAttr(s){ return escapeHtml(s); }
+
+    /* -------------------------
+       Initial bootstrap
+       ------------------------- */
+    (function bootstrap(){
+      // load config and render
+      loadConfig().then(()=>{ /* done */ });
+
+      // render sponsors
+      renderSponsors();
+
+      // init auth & enroll UI
+      initAuthUI();
+      initEnrollUI();
+
+      // update auth UI from existing state
+      updateAuthUI();
+
+      // wire modal preview close
+      document.getElementById("close-preview").addEventListener("click", ()=> {
+        document.getElementById("modal-preview").classList.add("hidden"); document.getElementById("modal-preview").classList.remove("flex");
+      });
+
+      // wire local data display refresh periodically
+      setInterval(()=> {
+        // keep sponsor grid updated in case clicks changed
+        renderSponsors();
+      }, 3000);
+    })();
+
+    /* -------------------------
+       Extra features: small UX helpers
+       ------------------------- */
+    // allow pressing Enter in auth modal to submit
+    document.getElementById("auth-pass").addEventListener("keydown", (e)=>{
+      if (e.key === "Enter") document.getElementById("auth-action").click();
+    });
+
+    // Expose minimal debugging in window for power users (local only)
+    window.SS = {
+      state: State,
+      config: CONFIG,
+      lsGet, lsSet
+    };
+  </script>
+</body>
+</html>
+```[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/kiwitcms/Kiwi/tree/6622e006140e202b55b6cc938375960687492cb9/tcms%2Fstatic%2Fjs%2Futils.js?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054 "1")[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/000744210/Ajax-Intercepter/tree/eafb957ef7887e21882e61e4d2b61adbd153ec0e/src%2Finject%2Finjected.js?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054 "2")[43dcd9a7-70db-4a1f-b0ae-981daa162054](https://github.com/mc3747/6_JSSummary/tree/336f559b7bcbad7c455b6ad0130c1729e7c463bb/1-jsSummary%2F4_js%E5%B7%A5%E5%85%B7%2Fsnippets%2Fstring%2Fescape-html-special-characters.md?citationMarker=43dcd9a7-70db-4a1f-b0ae-981daa162054 "3")    <!-- Events section -->
+    <section class="mb-8">
+      <div class="flex items-start justify-between">
+        <h2 class="text-xl font-semibold">Upcoming Events</h2>
+        <div class="text-sm text-gray-500" id="cfg-last-updated"></div>
+      </div>
+      <div id="events" class="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3"></div>
+    </section>
+
+    <hr class="my-8" />
+
+    <!-- Sponsors showcase -->
+    <section>
+      <div class="flex items-center justify-between">
+        <h2 class="text-xl font-semibold">Sponsors</h2>
+        <div class="text-sm text-gray-500">Click logos to record digital clicks</div>
+      </div>
+      <div id="sponsor-grid" class="mt-4 grid gap-4 grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6"></div>
+    </section>
+
+    <hr class="my-8" />
+
+    <!-- Admin Mode / Controls -->
+    <section id="admin-area" class="hidden">
+      <h2 class="text-xl font-semibold mb-3">Admin Mode</h2>
+
+      <div class="grid gap-6 md:grid-cols-3">
+        <div class="bg-white p-4 rounded shadow-sm">
+          <h3 class="font-medium">Event Fee Management</h3>
+          <p class="text-sm text-gray-600 mt-1">View and update the Event Fee (simulated config update)</p>
+          <div class="mt-3">
+            <label class="block text-sm text-gray-700">Event Fee (₹)</label>
+            <input id="event-fee" type="number" min="0" class="mt-1 w-full border rounded px-3 py-2" />
+            <div class="flex gap-2 mt-3">
+              <button id="save-fee" class="bg-indigo-600 text-white px-3 py-2 rounded">Save Fee</button>
+              <button id="reset-cfg" class="bg-gray-100 px-3 py-2 rounded">Reload Config</button>
+            </div>
+            <p class="text-xs text-gray-500 mt-2">Only Founder can save changes if role restricted in UI.</p>
+          </div>
+        </div>
+
+        <div class="bg-white p-4 rounded shadow-sm">
+          <h3 class="font-medium">Sponsor Tracking</h3>
+          <p class="text-sm text-gray-600 mt-1">View sponsor revenue, click counts, and add physical metrics</p>
+          <div id="sponsor-tracking" class="mt-3 text-sm"></div>
+        </div>
+
+        <div class="bg-white p-4 rounded shadow-sm">
+          <h3 class="font-medium">Local Data Log</h3>
+          <p class="text-sm text-gray-600 mt-1">View entire localStorage for debugging</p>
+          <div class="mt-3">
+            <button id="refresh-log" class="bg-indigo-600 text-white px-3 py-2 rounded">Refresh Log</button>
+            <button id="clear-local" class="bg-red-600 text-white px-3 py-2 rounded ml-2">Clear localStorage</button>
+            <pre id="local-log" class="mt-3 max-h-48 overflow-auto text-xs bg-gray-50 p-3 rounded"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <hr class="my-8" />
+
+    <footer class="text-sm text-gray-500 text-center py-6">
+      Built for free hosting. Config is read from a Google Sheet CSV endpoint. Transactional data is local only.
+    </footer>
+  </main>
+
+  <!-- LOGIN / SIGNUP MODAL -->
+  <div id="modal-auth" class="fixed inset-0 hidden items-center justify-center modal-backdrop z-40">
+    <div class="glass bg-white rounded-lg max-w-md w-full p-6">
+      <div class="flex items-center justify-between">
+        <h3 class="text-lg font-semibold">Login or Sign Up</h3>
+        <button id="close-auth" class="text-gray-500 hover:text-gray-700">&times;</button>
+      </div>
+      <p class="text-sm text-gray-600 mt-2">Sign up allowed only for Participant or Sponsor. Founder/Manager/Volunteer are login-only with preconfigured credentials.</p>
+
+      <div class="mt-4 space-y-3">
+        <input id="auth-email" placeholder="Email" class="w-full border px-3 py-2 rounded" />
+        <input id="auth-pass" type="password" placeholder="Password" class="w-full border px-3 py-2 rounded" />
+        <div class="flex items-center gap-3">
+          <select id="auth-role" class="border px-3 py-2 rounded w-full">
+            <option value="participant">Participant (Sign Up allowed)</option>
+            <option value="sponsor">Sponsor (Sign Up allowed)</option>
+            <option value="founder">Founder (Login only)</option>
+            <option value="manager">Manager (Login only)</option>
+            <option value="volunteer">Volunteer (Login only)</option>
+          </select>
+        </div>
+
+        <div class="flex gap-2">
+          <button id="auth-action" class="bg-indigo-600 text-white px-4 py-2 rounded">Login / Signup</button>
+          <button id="auth-guest" class="bg-gray-100 px-4 py-2 rounded">Continue as Guest</button>
+        </div>
+
+        <div id="auth-msg" class="text-sm text-red-600"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ENROLL / SPONSOR MODAL -->
+  <div id="modal-enroll" class="fixed inset-0 hidden items-start sm:items-center justify-center modal-backdrop z-40 overflow-auto py-8">
+    <div class="bg-white rounded-lg max-w-3xl w-full p-6 mx-4">
+      <div class="flex items-center justify-between">
+        <h3 class="text-lg font-semibold">Sponsor Enrollment & Ad Configurator</h3>
+        <button id="close-enroll" class="text-gray-500 hover:text-gray-700">&times;</button>
+      </div>
+
+      <p class="text-sm text-gray-600 mt-2">Configure ad components. Prices update in real time. Promo SANDHANI10 applies 10% discount.</p>
+
+      <div class="mt-4 grid gap-6 md:grid-cols-2">
+        <!-- left: configurator -->
+        <div>
+          <div class="space-y-4">
+            <!-- Drawing Books -->
+            <div class="p-3 bg-gray-50 rounded">
+              <div class="flex items-center justify-between">
+                <div>
+                  <h4 class="font-medium">Drawing Books</h4>
+                  <div class="text-xs text-gray-500">Specify space (sq.inch), side, and quantity</div>
+                </div>
+                <div>
+                  <label class="inline-flex items-center text-xs text-gray-600"><input id="db-enabled" type="checkbox" class="mr-2" /> Enable</label>
+                </div>
+              </div>
+
+              <div id="db-section" class="mt-3 hidden space-y-2">
+                <div class="grid grid-cols-2 gap-2">
+                  <input id="db-space" type="number" min="1" placeholder="Space (sq.inch)" class="border px-3 py-2 rounded" />
+                  <input id="db-qty" type="number" min="1" placeholder="Quantity" class="border px-3 py-2 rounded" />
+                </div>
+                <select id="db-side" class="border px-3 py-2 rounded w-full">
+                  <option value="front">Front Side (Premium)</option>
+                  <option value="back">Back Side (Standard)</option>
+                </select>
+                <div class="text-xs text-gray-500">Rates: Front = premiumRate per sq.inch; Back = standardRate per sq.inch</div>
+              </div>
+            </div>
+
+            <!-- Bags -->
+            <div class="p-3 bg-gray-50 rounded">
+              <div class="flex items-center justify-between">
+                <div>
+                  <h4 class="font-medium">Bags</h4>
+                  <div class="text-xs text-gray-500">Space (sq.inch) and quantity</div>
+                </div>
+                <div>
+                  <label class="inline-flex items-center text-xs text-gray-600"><input id="bag-enabled" type="checkbox" class="mr-2" /> Enable</label>
+                </div>
+              </div>
+
+              <div id="bag-section" class="mt-3 hidden space-y-2">
+                <div class="grid grid-cols-2 gap-2">
+                  <input id="bag-space" type="number" min="1" placeholder="Space (sq.inch)" class="border px-3 py-2 rounded" />
+                  <input id="bag-qty" type="number" min="1" placeholder="Quantity" class="border px-3 py-2 rounded" />
+                </div>
+                <div class="text-xs text-gray-500">Rate: bagRate per sq.inch</div>
+              </div>
+            </div>
+
+            <!-- Banners -->
+            <div class="p-3 bg-gray-50 rounded">
+              <div class="flex items-center justify-between">
+                <div>
+                  <h4 class="font-medium">Banners</h4>
+                  <div class="text-xs text-gray-500">Choose placement and quantity</div>
+                </div>
+                <div>
+                  <label class="inline-flex items-center text-xs text-gray-600"><input id="banner-enabled" type="checkbox" class="mr-2" /> Enable</label>
+                </div>
+              </div>
+
+              <div id="banner-section" class="mt-3 hidden space-y-2">
+                <select id="banner-place" class="border px-3 py-2 rounded w-full">
+                  <!-- options populated in JS -->
+                </select>
+                <input id="banner-qty" type="number" min="1" placeholder="Quantity" class="border px-3 py-2 rounded w-full" />
+                <div class="text-xs text-gray-500">Each placement has base price and multiplier applied automatically</div>
+              </div>
+            </div>
+
+            <!-- Promo -->
+            <div class="p-3 bg-gray-50 rounded">
+              <h4 class="font-medium">Promo Code</h4>
+              <input id="promo" placeholder="Enter promo code" class="mt-2 w-full border px-3 py-2 rounded" />
+              <div id="promo-msg" class="text-xs text-green-600 mt-2"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- right: summary & sponsor info -->
+        <div>
+          <div class="bg-white p-4 rounded shadow-sm">
+            <h4 class="font-medium">Summary</h4>
+            <div class="mt-3 space-y-2 text-sm">
+              <div class="flex justify-between"><div>Drawing Books</div><div id="sum-db">₹0</div></div>
+              <div class="flex justify-between"><div>Bags</div><div id="sum-bag">₹0</div></div>
+              <div class="flex justify-between"><div>Banners</div><div id="sum-banner">₹0</div></div>
+              <div class="border-t pt-2 mt-2 text-sm">
+                <div class="flex justify-between"><div>Subtotal</div><div id="sum-sub">₹0</div></div>
+                <div class="flex justify-between"><div>Discount</div><div id="sum-discount">-₹0</div></div>
+                <div class="flex justify-between font-semibold text-lg"><div>Payable Total</div><div id="sum-total">₹0</div></div>
+              </div>
+            </div>
+
+            <div class="mt-4">
+              <h4 class="font-medium">Sponsor Details</h4>
+              <input id="sname" placeholder="Sponsor Name" class="mt-2 w-full border px-3 py-2 rounded" />
+              <input id="surl" placeholder="Website or Contact URL (optional)" class="mt-2 w-full border px-3 py-2 rounded" />
+              <input id="slogo" placeholder="Logo image URL (optional)" class="mt-2 w-full border px-3 py-2 rounded" />
+              <div class="flex gap-2 mt-3">
+                <button id="confirm-enroll" class="bg-green-600 text-white px-3 py-2 rounded flex-1">Confirm & Save (Local)</button>
+                <button id="preview-sponsor" class="bg-gray-100 px-3 py-2 rounded">Preview</button>
+              </div>
+              <p class="text-xs text-gray-500 mt-2">All enrollment data will be stored locally in your browser only.</p>
+            </div>
+          </div>
+
+          <div id="enroll-msg" class="mt-3 text-sm"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sponsor preview modal -->
+  <div id="modal-preview" class="fixed inset-0 hidden items-center justify-center modal-backdrop z-50">
+    <div class="bg-white rounded-lg p-6 max-w-sm w-full">
+      <div class="flex items-center justify-between">
+        <h4 class="font-medium">Sponsor Preview</h4>
+        <button id="close-preview" class="text-gray-500">&times;</button>
+      </div>
+      <div id="preview-content" class="mt-3"></div>
+    </div>
+  </div>
+
+  <script>
+    /***************************************************************************
+     * Sreejan Sandhani — Single-file CMS & Sponsorship Enrollment
+     * - Read-only config/events: load from Google Sheet CSV endpoint via fetch
+     * - Transactional data: stored in localStorage (user alerted)
+     * - Tailwind used for styling via CDN
+     * - Hardcoded admin credentials: founder, manager, volunteer (login-only)
+     * - Sponsor enrollment with granular pricing, promo code handling, click tracking
+     **************************************************************************/
+
+    /* -------------------------
+       Configuration (in-code)
+       ------------------------- */
+    const CONFIG = {
+      // Google Sheet CSV endpoint (example placeholder). Replace with user's published CSV URL if desired.
+      // Expected CSV columns: title,date,description,fee
       sheetCsv: "https://docs.google.com/spreadsheets/d/e/2PACX-FAKE-PUBLIC-CSV-URL/pub?output=csv",
       // local fallback config used if CSV fetch fails
       fallbackEvents: [
