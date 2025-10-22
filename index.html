@@ -1,0 +1,1292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sreejan Sandhani: CMS, Enrollment, & Space-Based Pricing (Google Sheets DB)</title>
+    <!-- Load Tailwind and Inter Font -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script>
+        // --- Configuration Constants ---
+        const CURRENCY_SYMBOL = '₹'; 
+        // !!! IMPORTANT: REPLACE THIS URL !!!
+        // This must be the published JSON endpoint from your Google Sheet (see SETUP_GUIDE.md)
+        const GOOGLE_SHEET_JSON_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vR9sYOi5ufLQN--VhNROSY9j6DcfBWAi4XhqLeLHYCvA9nTvxYQ8JwiirZ2p1e7Dsf29LqdVSkaoDqq/pubhtml?gid=0&single=true'; 
+        
+        // --- Local Storage Keys ---
+        const USER_ID_KEY = 'sreejan_current_user_id';
+        const SPONSORS_KEY = 'sreejan_sponsors';
+        const ENROLLMENTS_KEY = 'sreejan_enrollments';
+        const SPONSOR_CLICKS_KEY = 'sreejan_sponsor_clicks';
+        const SREEJAN_USERS_KEY = 'sreejan_users'; // Key for mock user accounts
+
+        // --- Mock Internal Users (Hardcoded for initial setup) ---
+        // Volunteers are added here as they do not have a Sign Up option.
+        const INTERNAL_USERS = [
+            { username: 'founder@ss.com', password: 'admin', role: 'Founder' },
+            { username: 'manager@ss.com', password: 'admin', role: 'Manager' },
+            { username: 'volunteer@ss.com', password: 'admin', role: 'Volunteer' } // New Role
+        ];
+
+        // --- Granular Permissions ---
+        const PERMISSIONS = { 
+            // Only Founder can modify core event data (like fees)
+            'core_management': ['Founder'], 
+            // Founder and Manager can track sponsor performance and view logs
+            'sponsor_tracking': ['Founder', 'Manager'],
+            'view_logs': ['Founder', 'Manager']
+        };
+
+        // --- Pricing Configuration (Hardcoded for calculation reliability) ---
+        const AD_RATES = {
+            drawingBook: {
+                frontSideRatePerSqInch: 2.50, 
+                backSideRatePerSqInch: 1.50,
+            },
+            bag: {
+                ratePerSqInch: 3.50, 
+            },
+            bannerPlacements: [
+                { id: 'mainStage', name: 'Main Stage (Max Visibility)', multiplier: 3.0, basePrice: 1000 }, 
+                { id: 'sideRoad', name: 'Road Side (High Traffic)', multiplier: 1.5, basePrice: 500 },
+                { id: 'insideVenue', name: 'Inside Venue (General)', multiplier: 1.0, basePrice: 300 },
+                { id: 'foodCourt', name: 'Food Court Area', multiplier: 2.0, basePrice: 700 },
+            ]
+        };
+
+        // --- Initial Data Structure (Used if Sheets fetch fails) ---
+        const INITIAL_DATA_MOCK = {
+            logoUrl: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="%23E94F37" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /><path d="M21 12a9 9 0 11-18 0" /></svg>',
+            upcomingEvents: [
+                { id: 'e1', date: "Dec 10, 2025", venue: "City Hall", title: "Winter Art Challenge", description: "The annual grand drawing competition.", fee: 100 }, 
+            ],
+            digitalSponsors: [],
+            adRates: AD_RATES,
+        };
+
+        // --- Global State Variables ---
+        let siteData = INITIAL_DATA_MOCK;
+        let currentUser = null;
+        let currentUserId = 'guest';
+        let userRole = 'Guest'; 
+        let isAdminView = false;
+
+
+        // --- Utility Functions ---
+
+        const getStorage = (key, defaultValue = []) => {
+            try {
+                const data = localStorage.getItem(key);
+                return data ? JSON.parse(data) : defaultValue;
+            } catch (e) {
+                console.error(`Error reading localStorage key ${key}:`, e);
+                return defaultValue;
+            }
+        };
+
+        const setStorage = (key, value) => {
+            try {
+                localStorage.setItem(key, JSON.stringify(value));
+            } catch (e) {
+                console.error(`Error writing to localStorage key ${key}:`, e);
+            }
+        };
+
+        const simpleHash = (s) => { 
+            let hash = 0;
+            if (s.length === 0) return '0';
+            for (let i = 0; i < s.length; i++) {
+                const char = s.charCodeAt(i);
+                hash = ((hash << 5) - hash) - char;
+                hash |= 0;
+            }
+            return Math.abs(hash).toString(16);
+        };
+        
+        window.closeModal = (id) => document.getElementById(id).classList.add('hidden');
+        window.openModal = (id) => {
+            // Close all modals first
+            document.querySelectorAll('.fixed.inset-0.z-\\[101\\]').forEach(m => m.classList.add('hidden'));
+            document.getElementById(id).classList.remove('hidden');
+            // Clear any previous status messages
+            document.getElementById('login-status')?.textContent = '';
+            document.getElementById('signup-status')?.textContent = '';
+        };
+        
+        window.openLoginModal = () => window.openModal('login-modal');
+        window.openSignupModal = () => window.openModal('signup-modal');
+
+        // --- Mock Authentication Logic ---
+
+        const processLogin = (event) => {
+            event.preventDefault();
+            const form = event.target;
+            const username = form.elements['login-username'].value.trim().toLowerCase();
+            const password = form.elements['login-password'].value.trim();
+            const statusDiv = document.getElementById('login-status');
+            
+            const allUsers = getStorage(SREEJAN_USERS_KEY, INTERNAL_USERS.slice());
+            const foundUser = allUsers.find(u => u.username === username && u.password === password);
+
+            if (foundUser) {
+                currentUser = foundUser;
+                currentUserId = simpleHash(foundUser.username);
+                userRole = foundUser.role;
+                localStorage.setItem(USER_ID_KEY, currentUserId);
+
+                statusDiv.className = 'mt-4 text-sm font-medium text-green-600';
+                statusDiv.textContent = `Welcome back, ${foundUser.role}!`;
+                form.reset();
+                renderApp();
+                setTimeout(() => closeModal('login-modal'), 1000);
+            } else {
+                statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                statusDiv.textContent = 'Invalid username or password.';
+            }
+        };
+
+        const processSignup = (event) => {
+            event.preventDefault();
+            const form = event.target;
+            const username = form.elements['signup-username'].value.trim().toLowerCase();
+            const password = form.elements['signup-password'].value.trim();
+            const role = form.elements['signup-role'].value; // Will only be 'Participant' or 'Sponsor'
+            const statusDiv = document.getElementById('signup-status');
+            
+            let allUsers = getStorage(SREEJAN_USERS_KEY, INTERNAL_USERS.slice());
+            const internalUsernames = INTERNAL_USERS.map(u => u.username);
+
+            if (internalUsernames.includes(username)) {
+                 statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                 statusDiv.textContent = 'Cannot sign up with an internal email. Please log in.';
+                 return;
+            }
+            if (allUsers.find(u => u.username === username)) {
+                statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                statusDiv.textContent = 'Account already exists. Please log in.';
+                return;
+            }
+
+            if (!username || !password || !role) {
+                statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                statusDiv.textContent = 'Please fill out all fields.';
+                return;
+            }
+            
+            const newUser = { username, password, role };
+            allUsers.push(newUser);
+            setStorage(SREEJAN_USERS_KEY, allUsers);
+            
+            statusDiv.className = 'mt-4 text-sm font-medium text-green-600';
+            statusDiv.textContent = `Sign up successful as ${role}! Please log in now.`;
+            form.reset();
+            setTimeout(() => window.openModal('login-modal'), 1500);
+        };
+        
+        window.processLogout = () => {
+            currentUser = null;
+            currentUserId = 'guest';
+            userRole = 'Guest';
+            localStorage.removeItem(USER_ID_KEY);
+            isAdminView = false;
+            toggleAdminView(false); // Force switch back to site view
+            renderApp();
+        };
+
+        // --- Data Loading from Google Sheets (Read-Only) ---
+
+        const loadDataFromSheets = async () => {
+            try {
+                if (GOOGLE_SHEET_JSON_URL !== INITIAL_DATA_MOCK) {
+                    const response = await fetch(GOOGLE_SHEET_JSON_URL);
+                    const data = await response.json();
+                    
+                    if (data && data.upcomingEvents) {
+                        siteData = data;
+                        siteData.adRates = AD_RATES; 
+                    } else {
+                        throw new Error("Fetched data structure is invalid. Using mock data.");
+                    }
+                }
+            } catch (error) {
+                console.warn(`Could not fetch data from Google Sheet URL: ${error.message}. Using mock data.`);
+            }
+
+            // Initialize user storage with internal accounts if empty
+            let allUsers = getStorage(SREEJAN_USERS_KEY, []);
+            if (allUsers.length === 0) {
+                 allUsers = INTERNAL_USERS.slice();
+                 setStorage(SREEJAN_USERS_KEY, allUsers);
+            }
+            
+            // Re-establish session if ID exists
+            const storedUserId = localStorage.getItem(USER_ID_KEY);
+            if (storedUserId !== null) {
+                const foundUser = allUsers.find(u => simpleHash(u.username) === storedUserId);
+                if (foundUser) {
+                    currentUser = foundUser;
+                    currentUserId = storedUserId;
+                    userRole = foundUser.role;
+                } else {
+                    localStorage.removeItem(USER_ID_KEY);
+                }
+            }
+            
+            // Overlay sponsor data from local storage
+            const localSponsors = getStorage(SPONSORS_KEY, []);
+            siteData.digitalSponsors = localSponsors;
+
+            renderApp();
+        };
+
+
+        // --- Live Sponsor Click Tracking (Local Storage) ---
+
+        window.trackSponsorClick = (sponsorId, url, event) => {
+            event.preventDefault();
+            
+            const sponsorClicks = getStorage(SPONSOR_CLICKS_KEY, {});
+            const currentClicks = sponsorClicks[sponsorId] || 0;
+            sponsorClicks[sponsorId] = currentClicks + 1;
+            setStorage(SPONSOR_CLICKS_KEY, sponsorClicks);
+            
+            renderApp(); // Rerender to show new click count immediately
+            console.log(`Click tracked for ${sponsorId}. Navigating to: ${url}`);
+            window.open(url, '_blank');
+        };
+
+        // --- Sponsor Enrollment Logic (Simulated Write to Local Storage) ---
+
+        window.openSponsorEnrollmentModal = () => {
+            // Security Check: Only logged in Sponsors can enroll
+            if (userRole !== 'Sponsor') {
+                document.getElementById('enrollment-guard-message').textContent = 'Please log in or sign up as a Sponsor to enroll.';
+                window.openModal('enrollment-guard-modal');
+                return;
+            }
+            
+            document.getElementById('sponsor-enrollment-form').reset();
+            document.getElementById('enrollment-status').textContent = '';
+            document.getElementById('promo-code-status').textContent = '';
+            
+            // Populate Banner Placement Select
+            const bannerSelect = document.getElementById('banner-placement');
+            bannerSelect.innerHTML = siteData.adRates.bannerPlacements.map(p => 
+                `<option value="${p.id}" data-multiplier="${p.multiplier}" data-base-price="${p.basePrice}">${p.name} (${CURRENCY_SYMBOL}${((p.basePrice * p.multiplier) || 0).toFixed(0)} est.)</option>`
+            ).join('');
+            
+            calculateSponsorPrice();
+            document.getElementById('sponsor-enrollment-modal').classList.remove('hidden');
+        };
+
+        const calculateSponsorPrice = () => {
+            const form = document.getElementById('sponsor-enrollment-form');
+            const rates = siteData.adRates;
+            let subtotal = 0;
+            
+            // --- 1. Drawing Book Ad Calculation ---
+            const dbSize = parseFloat(form.elements['db-ad-size'].value) || 0;
+            const dbSide = form.elements['db-ad-side'].value;
+            const dbQty = parseInt(form.elements['db-ad-qty'].value) || 0;
+            
+            let dbRate = 0;
+            if (dbSide === 'front') {
+                dbRate = rates.drawingBook.frontSideRatePerSqInch;
+            } else if (dbSide === 'back') {
+                dbRate = rates.drawingBook.backSideRatePerSqInch;
+            }
+            
+            const dbCost = (dbSize > 0 && dbQty > 0) ? (dbSize * dbRate * dbQty) : 0;
+            subtotal += dbCost;
+            
+            // --- 2. Bag Ad Calculation ---
+            const bagSize = parseFloat(form.elements['bag-ad-size'].value) || 0;
+            const bagQty = parseInt(form.elements['bag-ad-qty'].value) || 0;
+            const bagRate = rates.bag.ratePerSqInch;
+            
+            const bagCost = (bagSize > 0 && bagQty > 0) ? (bagSize * bagRate * bagQty) : 0;
+            subtotal += bagCost;
+            
+            // --- 3. Banner Ad Calculation ---
+            const bannerPlacementId = form.elements['banner-placement'].value;
+            const bannerQty = parseInt(form.elements['banner-qty'].value) || 0;
+
+            const placement = rates.bannerPlacements.find(p => p.id === bannerPlacementId);
+            let bannerCost = 0;
+            
+            if (placement && bannerQty > 0) {
+                bannerCost = placement.basePrice * placement.multiplier * bannerQty;
+            }
+            subtotal += bannerCost;
+
+            // --- 4. Apply Discount/Promo ---
+            const promoCode = form.elements['promo-code'].value.toUpperCase();
+            let discount = 0;
+
+            if (promoCode === 'SANDHANI10' && subtotal > 0) {
+                discount = subtotal * 0.10;
+                document.getElementById('promo-code-status').textContent = 'Promo applied (10% off)!';
+                document.getElementById('promo-code-status').className = 'text-sm font-medium text-green-600';
+            } else if (promoCode) {
+                document.getElementById('promo-code-status').textContent = 'Invalid promo code.';
+                document.getElementById('promo-code-status').className = 'text-sm font-medium text-red-500';
+            } else {
+                document.getElementById('promo-code-status').textContent = '';
+                document.getElementById('promo-code-status').className = 'text-sm font-medium text-gray-600';
+            }
+            
+            let finalTotal = Math.max(0, subtotal - discount);
+
+            document.getElementById('enrollment-price').textContent = subtotal.toFixed(2);
+            document.getElementById('enrollment-discount').textContent = discount.toFixed(2);
+            document.getElementById('enrollment-total').textContent = finalTotal.toFixed(2);
+        };
+
+        const processSponsorEnrollment = (event) => {
+            event.preventDefault();
+            const form = event.target;
+            const name = form.elements['sponsor-name'].value.trim();
+            const link = form.elements['sponsor-link'].value.trim();
+            const logo = form.elements['sponsor-logo'].value.trim();
+            const statusDiv = document.getElementById('enrollment-status');
+            const finalTotal = parseFloat(document.getElementById('enrollment-total').textContent);
+            
+            // Get Ad Configuration details
+            const dbSize = parseFloat(form.elements['db-ad-size'].value) || 0;
+            const dbQty = parseInt(form.elements['db-ad-qty'].value) || 0;
+            const bagSize = parseFloat(form.elements['bag-ad-size'].value) || 0;
+            const bagQty = parseInt(form.elements['bag-ad-qty'].value) || 0;
+            const bannerQty = parseInt(form.elements['banner-qty'].value) || 0;
+            
+            const totalAdItems = (dbQty > 0 && dbSize > 0 ? 1 : 0) + (bagQty > 0 && bagSize > 0 ? 1 : 0) + (bannerQty > 0 ? 1 : 0);
+
+            if (!name || !link || !logo) {
+                statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                statusDiv.textContent = 'Please fill in all required fields (Name, Link, Logo).';
+                return;
+            }
+            
+            if (finalTotal === 0 && totalAdItems === 0) {
+                 statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                 statusDiv.textContent = 'Please configure at least one advertisement space.';
+                 return;
+            }
+            
+            if (finalTotal < 50 && totalAdItems > 0) { // Enforce a minimum realistic payment
+                 statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                 statusDiv.textContent = 'Minimum total payable must be greater than ₹50.';
+                 return;
+            }
+
+            try {
+                const newSponsorId = simpleHash(name + new Date().getTime());
+                
+                // Create a summary of the configuration for display/tracking
+                const adConfigurationSummary = [];
+                if (dbQty > 0 && dbSize > 0) adConfigurationSummary.push(`${dbQty} Book Ads (${dbSize} sq.in.)`);
+                if (bagQty > 0 && bagSize > 0) adConfigurationSummary.push(`${bagQty} Bag Ads (${bagSize} sq.in.)`);
+                if (bannerQty > 0) {
+                    const placementName = siteData.adRates.bannerPlacements.find(p => p.id === form.elements['banner-placement'].value)?.name || 'Custom';
+                    adConfigurationSummary.push(`${bannerQty} Banner Ads (${placementName})`);
+                }
+
+                const newSponsor = {
+                    id: newSponsorId,
+                    name: name,
+                    logoUrl: logo,
+                    linkUrl: link,
+                    totalPrice: finalTotal,
+                    enrollmentDate: new Date().toISOString(),
+                    adConfiguration: adConfigurationSummary.join(' | '), 
+                    bannerViews: 0 
+                };
+
+                // --- SIMULATION: Store in Local Storage ---
+                const currentSponsors = getStorage(SPONSORS_KEY, []);
+                currentSponsors.push(newSponsor);
+                setStorage(SPONSORS_KEY, currentSponsors);
+                siteData.digitalSponsors = currentSponsors;
+
+                statusDiv.className = 'mt-4 text-sm font-medium text-green-600';
+                statusDiv.textContent = `Enrollment successful! Total paid: ${CURRENCY_SYMBOL}${finalTotal.toFixed(2)}. (Data saved locally)`;
+                form.reset();
+                calculateSponsorPrice();
+                renderApp(); 
+                setTimeout(() => closeModal('sponsor-enrollment-modal'), 2500);
+
+            } catch (error) {
+                console.error("Sponsor enrollment failed:", error);
+                statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                statusDiv.textContent = `Enrollment failed. Error: ${error.message}`;
+            }
+        };
+
+        // --- Participant Enrollment Logic (Simulated Write to Local Storage) ---
+
+        window.openEnrollmentModal = (eventId) => {
+             // Security Check: Only logged in Participants can enroll
+            if (userRole !== 'Participant') {
+                document.getElementById('enrollment-guard-message').textContent = 'Please log in or sign up as a Participant to enroll in events.';
+                window.openModal('enrollment-guard-modal');
+                return;
+            }
+
+            const event = siteData.upcomingEvents.find(e => e.id === eventId);
+            if (!event) {
+                console.error("Event not found!");
+                return;
+            }
+
+            document.getElementById('enrollment-form').reset();
+            document.getElementById('enrollment-status').textContent = '';
+            document.getElementById('event-title-display').textContent = event.title;
+            document.getElementById('enrollment-event-id').value = eventId;
+            
+            const fee = event.fee.toFixed(0);
+            document.getElementById('enrollment-fee-display').textContent = fee; 
+            document.getElementById('enrollment-fee-currency').textContent = CURRENCY_SYMBOL; 
+            document.getElementById('enrollment-fee-display-button').textContent = fee; 
+
+            document.getElementById('enrollment-modal').classList.remove('hidden');
+        };
+
+
+        const processEnrollment = (event) => {
+            event.preventDefault();
+            const form = event.target;
+            const name = form.elements['participant-name'].value.trim();
+            const email = form.elements['participant-email'].value.trim();
+            const eventId = form.elements['event-id'].value;
+            const statusDiv = document.getElementById('enrollment-status');
+            
+            const eventDetails = siteData.upcomingEvents.find(e => e.id === eventId);
+            const eventFee = eventDetails ? eventDetails.fee : 0; 
+
+            if (!name || !email || !eventId) {
+                statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                statusDiv.textContent = 'Please fill in all required fields.';
+                return;
+            }
+            
+            // Check if already enrolled (simple check for same user/same event)
+            const currentEnrollments = getStorage(ENROLLMENTS_KEY, []);
+            const alreadyEnrolled = currentEnrollments.some(e => e.userId === currentUserId && e.eventId === eventId);
+
+            if (alreadyEnrolled) {
+                 statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                 statusDiv.textContent = 'You are already enrolled in this event.';
+                 return;
+            }
+
+            const participantData = {
+                userId: currentUserId, 
+                name: name,
+                email: email,
+                eventId: eventId,
+                status: 'Enrolled',
+                feePaid: eventFee, 
+                enrollmentDate: new Date().toISOString(),
+            };
+
+            try {
+                // --- SIMULATION: Store in Local Storage ---
+                currentEnrollments.push(participantData);
+                setStorage(ENROLLMENTS_KEY, currentEnrollments);
+
+                statusDiv.className = 'mt-4 text-sm font-medium text-green-600';
+                statusDiv.textContent = `Successfully enrolled for ${eventDetails.title}! (Data saved locally)`;
+                form.reset();
+                setTimeout(() => closeModal('enrollment-modal'), 2000);
+
+            } catch (error) {
+                console.error("Enrollment failed:", error);
+                statusDiv.className = 'mt-4 text-sm font-medium text-red-500';
+                statusDiv.textContent = `Enrollment failed. Error: ${error.message}`;
+            }
+        };
+
+
+        // --- Admin Logic for Event Fee Update (Simulated Write to Local Storage) ---
+
+        window.renderEventManagement = () => {
+            const container = document.getElementById('event-management-content');
+            
+            // CHECK CORE PERMISSION
+            if (!PERMISSIONS.core_management.includes(userRole)) {
+                container.innerHTML = '<p class="p-4 text-center text-red-500 font-bold">PERMISSION DENIED. Only Founders can manage event fees.</p>';
+                return;
+            }
+
+            const events = siteData.upcomingEvents || [];
+
+            if (events.length === 0) {
+                container.innerHTML = '<p class="p-4 text-center text-gray-500">No upcoming events configured in the sheet.</p>';
+                return;
+            }
+
+            container.innerHTML = events.map(event => `
+                <div class="bg-gray-50 p-4 rounded-lg flex items-center justify-between border-l-4 border-primary-art mb-4">
+                    <div class="flex-1">
+                        <h4 class="text-lg font-bold text-secondary-dark">${event.title}</h4>
+                        <p class="text-sm text-gray-500">${event.date} at ${event.venue}</p>
+                    </div>
+                    <div class="flex items-center space-x-3">
+                        <label class="text-sm font-medium text-gray-700">Fee (${CURRENCY_SYMBOL}):</label>
+                        <input 
+                            type="number" 
+                            id="fee-input-${event.id}" 
+                            value="${event.fee || 0}" 
+                            min="0" 
+                            class="w-24 p-2 border rounded-lg text-center font-semibold text-primary-art focus:ring-accent-brush focus:border-accent-brush"
+                        >
+                        <button 
+                            onclick="updateEventFee('${event.id}')" 
+                            class="bg-accent-brush text-secondary-dark p-2 rounded-lg hover:bg-accent-brush/80 transition text-sm whitespace-nowrap"
+                        >
+                            Update Fee (Local)
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        };
+
+        window.updateEventFee = (eventId) => {
+            if (!PERMISSIONS.core_management.includes(userRole)) return; // Double check
+
+            const inputElement = document.getElementById(`fee-input-${eventId}`);
+            if (!inputElement) return;
+
+            const newFee = parseInt(inputElement.value) || 0;
+            const container = document.getElementById('event-management-content');
+            
+            try {
+                const updatedEvents = siteData.upcomingEvents.map(e => 
+                    e.id === eventId ? { ...e, fee: newFee } : e
+                );
+
+                siteData.upcomingEvents = updatedEvents; // Update local state
+
+                container.insertAdjacentHTML('beforebegin', `<p id="temp-status-fee" class="text-center text-sm font-semibold text-orange-600 mb-2">Fee for ${siteData.upcomingEvents.find(e => e.id === eventId).title} updated to ${CURRENCY_SYMBOL}${newFee}! (LOCAL CHANGE ONLY)</p>`);
+                setTimeout(() => document.getElementById('temp-status-fee')?.remove(), 3500);
+                
+                renderApp(); // Rerender main site events
+
+            } catch (error) {
+                console.error("Error updating event fee:", error);
+                container.insertAdjacentHTML('beforebegin', `<p id="temp-status-fee-fail" class="text-center text-sm font-semibold text-red-600 mb-2">Failed to update fee: ${error.message}</p>`);
+                setTimeout(() => document.getElementById('temp-status-fee-fail')?.remove(), 3500);
+            }
+        };
+
+
+        // --- Sponsor Tracking Admin Logic (Simulated Write to Local Storage) ---
+        window.renderSponsorTracking = () => {
+             const container = document.getElementById('sponsor-tracking-content');
+            // CHECK SPONSOR TRACKING PERMISSION
+            if (!PERMISSIONS.sponsor_tracking.includes(userRole)) {
+                container.innerHTML = '<p class="p-4 text-center text-red-500 font-bold">PERMISSION DENIED. Only Founders and Managers can access Sponsor Tracking.</p>';
+                return;
+            }
+            
+            const sponsors = siteData.digitalSponsors || [];
+            const sponsorClicks = getStorage(SPONSOR_CLICKS_KEY, {});
+
+            if (sponsors.length === 0) {
+                container.innerHTML = '<p class="p-4 text-center text-gray-500">No active sponsors found.</p>';
+                return;
+            }
+
+            container.innerHTML = sponsors.map(sponsor => {
+                const digitalClicks = sponsorClicks[sponsor.id] || 0;
+                const bannerViews = sponsor.bannerViews !== undefined ? sponsor.bannerViews : 0;
+
+                return `
+                    <div class="bg-white p-4 rounded-lg shadow-md flex flex-col md:flex-row items-start md:items-center justify-between border-l-4 border-accent-brush mb-4">
+                        <div class="flex-1 mb-4 md:mb-0">
+                            <h4 class="text-lg font-bold text-secondary-dark">${sponsor.name}</h4>
+                            <p class="text-xs text-gray-500">Configuration: ${sponsor.adConfiguration || 'N/A'}</p>
+                            <p class="text-sm text-gray-500">Total Revenue: ${CURRENCY_SYMBOL}${sponsor.totalPrice.toFixed(2)}</p>
+                            <p class="text-sm font-bold text-primary-art mt-1">Digital Clicks (Local): ${digitalClicks}</p>
+                        </div>
+                        
+                        <div class="flex flex-wrap gap-4 items-center">
+                            <div class="flex items-center space-x-2">
+                                <label class="text-sm font-medium text-gray-600">Banner Views:</label>
+                                <input type="number" id="${sponsor.id}-bannerViews" value="${bannerViews}" class="w-20 p-1 border rounded-lg text-sm text-center">
+                            </div>
+                            <button onclick="updateSponsorMetrics('${sponsor.id}')" class="bg-green-500 text-white p-2 rounded-lg hover:bg-green-600 transition text-sm whitespace-nowrap">Update Metrics (Local)</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        };
+
+        window.updateSponsorMetrics = (sponsorId) => {
+             if (!PERMISSIONS.sponsor_tracking.includes(userRole)) return; // Double check
+
+            const container = document.getElementById('sponsor-tracking-content');
+            const sponsor = siteData.digitalSponsors.find(s => s.id === sponsorId);
+            if (!sponsor) return;
+
+            const input = document.getElementById(`${sponsorId}-bannerViews`);
+            const newBannerViews = parseInt(input.value) || 0;
+            
+            try {
+                const updatedSponsors = siteData.digitalSponsors.map(s => 
+                    s.id === sponsorId ? { ...s, bannerViews: newBannerViews } : s
+                );
+                
+                siteData.digitalSponsors = updatedSponsors; // Update local state
+                setStorage(SPONSORS_KEY, updatedSponsors); // Update local storage
+
+                container.insertAdjacentHTML('beforebegin', `<p id="temp-status-${sponsorId}" class="text-center text-sm font-semibold text-orange-600 mb-2">Metrics for ${sponsor.name} saved successfully! (LOCAL CHANGE ONLY)</p>`);
+                setTimeout(() => document.getElementById(`temp-status-${sponsorId}`)?.remove(), 3500);
+                
+                renderSponsorTracking(); // Rerender admin tracking tab
+
+            } catch (error) {
+                console.error("Error updating sponsor metrics:", error);
+                container.insertAdjacentHTML('beforebegin', `<p id="temp-status-${sponsorId}" class="text-center text-sm font-semibold text-red-600 mb-2">Failed to save metrics: ${error.message}</p>`);
+                setTimeout(() => document.getElementById(`temp-status-${sponsorId}`)?.remove(), 2500);
+            }
+        };
+
+
+        // --- Rendering Functions ---
+
+        const renderApp = () => {
+            const sponsorClicks = getStorage(SPONSOR_CLICKS_KEY, {});
+
+            // Update Header Status
+            const authStatus = document.getElementById('auth-status');
+            if (userRole === 'Guest') {
+                authStatus.innerHTML = `<button onclick="openLoginModal()" class="text-lg text-white bg-primary-art py-1 px-3 rounded-full hover:bg-primary-art/80 transition duration-300 transform hover:scale-105">Login</button>`;
+            } else {
+                 authStatus.innerHTML = `
+                    <div class="flex items-center space-x-2">
+                        <span class="text-sm font-medium text-secondary-dark hidden md:inline">Logged in as: <span class="font-bold text-primary-art">${userRole}</span></span>
+                        <button onclick="processLogout()" class="text-lg text-white bg-accent-brush py-1 px-3 rounded-full hover:bg-accent-brush/80 transition duration-300 transform hover:scale-105">Logout</button>
+                    </div>
+                `;
+            }
+
+            // Update Admin Toggle visibility and state
+            const adminToggle = document.getElementById('admin-toggle');
+            const hasAdminAccess = PERMISSIONS.core_management.includes(userRole) || PERMISSIONS.sponsor_tracking.includes(userRole) || PERMISSIONS.view_logs.includes(userRole);
+            adminToggle.classList.toggle('hidden', !hasAdminAccess);
+            
+            // 1. Render Header/Logo
+            const logoContainer = document.getElementById('site-logo');
+            const logoUrl = siteData.logoUrl || INITIAL_DATA_MOCK.logoUrl;
+            logoContainer.innerHTML = logoUrl.startsWith('data:image/svg')
+                ? logoUrl
+                : `<img src="${logoUrl}" alt="Sreejan Sandhani Logo" onerror="this.onerror=null;this.src='https://placehold.co/32x32/ccc/333?text=LOGO'" class="w-8 h-8 rounded-full object-cover">`;
+
+            // 2. Render Upcoming Events 
+            const eventContainer = document.getElementById('upcoming-events-list');
+            const events = siteData.upcomingEvents || INITIAL_DATA_MOCK.upcomingEvents;
+            eventContainer.innerHTML = events.map(event => `
+                <div class="bg-white p-6 rounded-xl shadow-lg border-l-4 border-primary-art card-hover-effect flex flex-col justify-between">
+                    <div>
+                        <h3 class="text-2xl font-bold text-secondary-dark mb-2">${event.title}</h3>
+                        <p class="text-gray-600 mb-3">${event.description}</p>
+                        <p class="text-sm font-medium text-gray-500">Date: <span class="text-secondary-dark">${event.date}</span></p>
+                        <p class="text-sm font-medium text-gray-500 mb-4">Venue: <span class="text-secondary-dark">${event.venue}</span></p>
+                    </div>
+                    <div>
+                        <p class="text-lg font-extrabold text-primary-art mb-3">Fee: ${CURRENCY_SYMBOL}${event.fee.toFixed(0)}</p>
+                        <button onclick="openEnrollmentModal('${event.id}')" class="w-full bg-accent-brush text-secondary-dark font-semibold py-2 rounded-lg hover:bg-accent-brush/80 transition transform hover:scale-[1.01]">
+                            Enroll Now
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+
+
+            // 3. Render Digital Sponsors
+            const sponsorContainer = document.getElementById('digital-sponsors-list');
+            sponsorContainer.innerHTML = (siteData.digitalSponsors || []).map(sponsor => {
+                const digitalClicks = sponsorClicks[sponsor.id] || 0;
+                return `
+                <div class="bg-white p-4 rounded-lg shadow-md flex flex-col items-center justify-center transition duration-300 hover:shadow-xl border border-gray-100 relative">
+                    <img src="${sponsor.logoUrl}" alt="${sponsor.name} Logo" class="w-16 h-16 rounded-full object-contain mb-2" onerror="this.onerror=null;this.src='https://placehold.co/64x64/E94F37/FFFFFF?text=L'">
+                    <span class="text-sm font-semibold text-secondary-dark text-center">${sponsor.name}</span>
+                    <span class="text-xs text-gray-500 mt-1 text-center">${sponsor.adConfiguration || 'Digital Only'}</span>
+                    <span class="text-xs text-primary-art font-medium mt-1">${digitalClicks} Clicks</span>
+                    <button 
+                        onclick="trackSponsorClick('${sponsor.id}', '${sponsor.linkUrl}', event)" 
+                        class="absolute inset-0 z-10 cursor-pointer"
+                        aria-label="Visit ${sponsor.name}"
+                        ></button>
+                </div>
+            `;
+            }).join('');
+
+            // Hide loading overlay
+            document.getElementById('loading-overlay').classList.add('hidden');
+        };
+
+        // --- Initialization and Event Listeners ---
+        
+        const toggleAdminView = (shouldBeAdmin) => { 
+            if (shouldBeAdmin === false) { // Forced switch to public site on logout
+                 isAdminView = false;
+            } else {
+                const hasAdminAccess = PERMISSIONS.core_management.includes(userRole) || PERMISSIONS.sponsor_tracking.includes(userRole) || PERMISSIONS.view_logs.includes(userRole);
+                if (!hasAdminAccess) {
+                    console.warn("Access Denied: You do not have permission to view the Admin Panel.");
+                    return; 
+                }
+                isAdminView = !isAdminView;
+            }
+
+            document.getElementById('admin-toggle').textContent = isAdminView ? 'View Site' : 'Admin Mode';
+            document.getElementById('main-site-content').classList.toggle('hidden', isAdminView);
+            document.getElementById('admin-panel').classList.toggle('hidden', !isAdminView);
+            document.body.classList.toggle('bg-light-canvas', !isAdminView);
+            document.body.classList.toggle('bg-gray-200', isAdminView);
+            
+            if (isAdminView) {
+                document.getElementById('admin-role-display').textContent = userRole;
+                // Default to the highest available permission tab
+                const defaultTab = PERMISSIONS.core_management.includes(userRole) ? 'core-tab' : 'sponsor-tracking-tab';
+                
+                const firstTabButton = document.querySelector(`[data-target="${defaultTab}"]`);
+                if(firstTabButton) switchAdminTab(defaultTab, firstTabButton);
+            }
+            
+            // Re-render tabs to ensure visibility is correct
+            renderAdminTabs();
+        };
+
+        const renderAdminTabs = () => {
+             const coreTab = document.querySelector('[data-target="core-tab"]');
+             const sponsorTab = document.querySelector('[data-target="sponsor-tracking-tab"]');
+             const logTab = document.querySelector('[data-target="log-tab"]');
+
+             coreTab.classList.toggle('hidden', !PERMISSIONS.core_management.includes(userRole));
+             sponsorTab.classList.toggle('hidden', !PERMISSIONS.sponsor_tracking.includes(userRole));
+             logTab.classList.toggle('hidden', !PERMISSIONS.view_logs.includes(userRole));
+        }
+
+        const initApp = async () => {
+            await loadDataFromSheets();
+            
+            document.getElementById('admin-toggle').addEventListener('click', () => toggleAdminView());
+            document.getElementById('sponsor-enrollment-form').addEventListener('submit', processSponsorEnrollment);
+            document.getElementById('enrollment-form').addEventListener('submit', processEnrollment);
+            document.getElementById('login-form').addEventListener('submit', processLogin);
+            document.getElementById('signup-form').addEventListener('submit', processSignup);
+            
+            // Add listeners for all configurable inputs
+            document.querySelectorAll('#ad-config-inputs input, #ad-config-inputs select').forEach(el => {
+                el.addEventListener('input', calculateSponsorPrice);
+            });
+        };
+        
+        const switchAdminTab = (tabId, element) => {
+             // CHECK PERMISSION before rendering content
+            if (tabId === 'core-tab' && !PERMISSIONS.core_management.includes(userRole)) return;
+            if (tabId === 'sponsor-tracking-tab' && !PERMISSIONS.sponsor_tracking.includes(userRole)) return;
+            if (tabId === 'log-tab' && !PERMISSIONS.view_logs.includes(userRole)) return;
+
+            document.querySelectorAll('.tab-pane').forEach(pane => pane.classList.add('hidden'));
+            document.getElementById(tabId).classList.remove('hidden');
+            document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+            element.classList.add('active');
+
+            if (tabId === 'core-tab') window.renderEventManagement(); 
+            if (tabId === 'sponsor-tracking-tab') window.renderSponsorTracking();
+            if (tabId === 'log-tab') {
+                 document.getElementById('audit-log-content').innerHTML = `
+                    <p class="text-xs font-semibold text-primary-art mb-2">Participant Enrollments:</p>
+                    <pre class="text-xs text-gray-800 whitespace-pre-wrap mb-4">${JSON.stringify(getStorage(ENROLLMENTS_KEY, []), null, 2)}</pre>
+                    <p class="text-xs font-semibold text-primary-art mb-2">All Local Users (Admins, Sponsors, Participants):</p>
+                    <pre class="text-xs text-gray-800 whitespace-pre-wrap">${JSON.stringify(getStorage(SREEJAN_USERS_KEY, []), null, 2)}</pre>
+                `;
+            }
+        }
+
+        window.onload = initApp;
+
+    </script>
+
+    <!-- Tailwind Config and Custom Styles -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'primary-art': '#E94F37',
+                        'secondary-dark': '#1F2937',
+                        'light-canvas': '#F9FAFB',
+                        'accent-brush': '#4CC9F0',
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    <style>
+        html { scroll-behavior: smooth; }
+        .card-hover-effect { transition: all 0.3s ease; }
+        .card-hover-effect:hover { transform: translateY(-3px) scale(1.005); box-shadow: 0 15px 25px -5px rgba(0, 0, 0, 0.15); }
+        .tab-button {
+            padding: 8px 16px;
+            cursor: pointer;
+        }
+        .tab-button.active {
+            border-bottom-color: #E94F37;
+            color: #E94F37;
+            font-weight: 600;
+            border-bottom-width: 2px;
+        }
+        .modal-bg { background-color: rgba(0, 0, 0, 0.6); }
+    </style>
+</head>
+
+<body class="font-sans bg-light-canvas text-secondary-dark">
+
+    <!-- Enrollment Guard Modal -->
+    <div id="enrollment-guard-modal" class="fixed inset-0 z-[101] hidden modal-bg flex items-center justify-center p-4">
+        <div class="bg-white rounded-xl w-full max-w-sm shadow-2xl transform transition-all overflow-hidden p-8 text-center">
+            <h3 class="text-2xl font-bold text-red-500 mb-4">Action Required</h3>
+            <p id="enrollment-guard-message" class="text-gray-700 mb-6 font-medium">Please log in or sign up to continue.</p>
+            <button onclick="closeModal('enrollment-guard-modal'); openLoginModal();" class="w-full bg-primary-art text-white font-semibold py-3 rounded-lg hover:bg-primary-art/80 transition duration-300">
+                Go to Login / Sign Up
+            </button>
+        </div>
+    </div>
+
+    <!-- Login Modal -->
+    <div id="login-modal" class="fixed inset-0 z-[101] hidden modal-bg flex items-center justify-center p-4">
+        <div class="bg-white rounded-xl w-full max-w-md shadow-2xl transform transition-all overflow-hidden p-8">
+            <h3 class="text-3xl font-bold text-secondary-dark mb-4 border-b pb-2">User Login</h3>
+            <p class="text-sm text-red-500 mb-6 font-semibold">NOTE: This is mock authentication using browser's local storage.</p>
+            
+            <form id="login-form">
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Email (Username)</label>
+                        <input type="email" name="login-username" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="your@email.com">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                        <input type="password" name="login-password" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="******">
+                    </div>
+                </div>
+
+                <button type="submit" class="w-full bg-primary-art text-white font-semibold py-3 mt-6 rounded-lg hover:bg-primary-art/80 transition duration-300 shadow-lg text-lg">
+                    Login
+                </button>
+                <p id="login-status" class="mt-4 text-center"></p>
+            </form>
+
+            <p class="mt-6 text-center text-sm text-gray-600">
+                New Participant or Sponsor? 
+                <button onclick="closeModal('login-modal'); openSignupModal();" class="text-accent-brush font-semibold hover:text-primary-art transition">
+                    Create an account
+                </button>
+            </p>
+            <p class="text-center text-xs text-gray-500 mt-2">
+                (Internal Test Accounts: founder/manager/volunteer@ss.com with password 'admin')
+            </p>
+
+            <div class="mt-4 text-center">
+                <button onclick="closeModal('login-modal')" class="text-gray-500 hover:text-gray-700 text-sm">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sign Up Modal (Only for Participants/Sponsors) -->
+    <div id="signup-modal" class="fixed inset-0 z-[101] hidden modal-bg flex items-center justify-center p-4">
+        <div class="bg-white rounded-xl w-full max-w-md shadow-2xl transform transition-all overflow-hidden p-8">
+            <h3 class="text-3xl font-bold text-secondary-dark mb-4 border-b pb-2">Create Account</h3>
+            <p class="text-sm text-red-500 mb-6 font-semibold">NOTE: Only Participants and Sponsors can sign up here.</p>
+            
+            <form id="signup-form">
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Email (Username)</label>
+                        <input type="email" name="signup-username" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="your@email.com">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                        <input type="password" name="signup-password" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="******">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">I am a...</label>
+                        <!-- Only Participant and Sponsor are available for sign-up -->
+                        <select name="signup-role" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art">
+                            <option value="Participant">Participant</option>
+                            <option value="Sponsor">Sponsor</option>
+                        </select>
+                    </div>
+                </div>
+
+                <button type="submit" class="w-full bg-accent-brush text-secondary-dark font-semibold py-3 mt-6 rounded-lg hover:bg-accent-brush/80 transition duration-300 shadow-lg text-lg">
+                    Sign Up
+                </button>
+                <p id="signup-status" class="mt-4 text-center"></p>
+            </form>
+
+            <p class="mt-6 text-center text-sm text-gray-600">
+                Already have an account? 
+                <button onclick="closeModal('signup-modal'); openLoginModal();" class="text-primary-art font-semibold hover:text-accent-brush transition">
+                    Go to Login
+                </button>
+            </p>
+
+            <div class="mt-4 text-center">
+                <button onclick="closeModal('signup-modal')" class="text-gray-500 hover:text-gray-700 text-sm">Close</button>
+            </div>
+        </div>
+    </div>
+
+
+    <!-- Sponsor Enrollment Modal -->
+    <div id="sponsor-enrollment-modal" class="fixed inset-0 z-[101] hidden modal-bg flex items-center justify-center p-4">
+        <div class="bg-white rounded-xl w-full max-w-4xl shadow-2xl transform transition-all overflow-y-auto max-h-screen">
+            <div class="p-8">
+                <h3 class="text-3xl font-bold text-secondary-dark mb-6 border-b pb-2">Custom Ad Space Partnership</h3>
+                <p class="text-sm text-red-500 mb-4 font-semibold">NOTE: Enrollment data is saved to your browser's local storage only. It is not written back to the Google Sheet.</p>
+                <form id="sponsor-enrollment-form">
+                    
+                    <!-- Basic Details -->
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Company/Partner Name*</label>
+                            <input type="text" name="sponsor-name" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="Acme Corp">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Website Link*</label>
+                            <input type="url" name="sponsor-link" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="https://acme.com">
+                        </div>
+                         <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Logo URL (Public Link)*</label>
+                            <input type="url" name="sponsor-logo" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="https://logo.com/acme.png">
+                        </div>
+                    </div>
+
+                    <!-- Ad Configurator Section -->
+                    <div id="ad-config-inputs" class="mb-8 border-2 border-primary-art/50 p-6 rounded-xl bg-primary-art/5 space-y-6">
+                        <h4 class="text-2xl font-bold text-primary-art mb-4">Advertisement Space Configurator</h4>
+                        <p class="text-sm text-gray-600 mb-4">Enter the required space (sq inch) and quantity for your advertisements.</p>
+
+                        <!-- Drawing Book Ads -->
+                        <fieldset class="border p-4 rounded-lg bg-white shadow-sm">
+                            <legend class="text-lg font-semibold text-secondary-dark px-2">1. Drawing Book Ads (Price per sq. inch)</legend>
+                            <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 mt-2">
+                                <div class="col-span-1">
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Space (Sq. Inch)</label>
+                                    <input type="number" name="db-ad-size" value="0" min="0" step="0.1" class="w-full p-2 border rounded-lg" placeholder="10.0">
+                                </div>
+                                <div class="col-span-1">
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Side</label>
+                                    <select name="db-ad-side" class="w-full p-2 border rounded-lg">
+                                        <option value="front">Front Side (Premium)</option>
+                                        <option value="back">Back Side</option>
+                                    </select>
+                                </div>
+                                <div class="col-span-1">
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Quantity (Books)</label>
+                                    <input type="number" name="db-ad-qty" value="0" min="0" class="w-full p-2 border rounded-lg" placeholder="100">
+                                </div>
+                                <div class="col-span-1 flex items-end">
+                                    <p class="text-sm text-gray-500">Rate: ${CURRENCY_SYMBOL}2.50 / ${CURRENCY_SYMBOL}1.50 per sq.in.</p>
+                                </div>
+                            </div>
+                        </fieldset>
+
+                        <!-- Branded Bag Ads -->
+                        <fieldset class="border p-4 rounded-lg bg-white shadow-sm">
+                            <legend class="text-lg font-semibold text-secondary-dark px-2">2. Branded Bag Ads (Price per sq. inch)</legend>
+                            <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 mt-2">
+                                <div class="col-span-1">
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Space (Sq. Inch)</label>
+                                    <input type="number" name="bag-ad-size" value="0" min="0" step="0.1" class="w-full p-2 border rounded-lg" placeholder="15.0">
+                                </div>
+                                <div class="col-span-1">
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Quantity (Bags)</label>
+                                    <input type="number" name="bag-ad-qty" value="0" min="0" class="w-full p-2 border rounded-lg" placeholder="50">
+                                </div>
+                                <div class="col-span-2 flex items-end">
+                                    <p class="text-sm text-gray-500">Rate: ${CURRENCY_SYMBOL}3.50 per sq.in.</p>
+                                </div>
+                            </div>
+                        </fieldset>
+                        
+                        <!-- Event Banners -->
+                        <fieldset class="border p-4 rounded-lg bg-white shadow-sm">
+                            <legend class="text-lg font-semibold text-secondary-dark px-2">3. Event Banners (Price depends on placement)</legend>
+                            <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 mt-2">
+                                <div class="col-span-2">
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Placement Location</label>
+                                    <select id="banner-placement" name="banner-placement" class="w-full p-2 border rounded-lg">
+                                        <!-- Options populated by JS -->
+                                    </select>
+                                </div>
+                                <div class="col-span-1">
+                                    <label class="block text-xs font-medium text-gray-700 mb-1">Quantity (Banners)</label>
+                                    <input type="number" name="banner-qty" value="0" min="0" class="w-full p-2 border rounded-lg" placeholder="1">
+                                </div>
+                                <div class="col-span-1 flex items-end">
+                                    <p class="text-sm text-gray-500">Size is considered standard.</p>
+                                </div>
+                            </div>
+                        </fieldset>
+                    </div>
+
+                    <!-- Pricing Summary & Promo Code -->
+                    <div class="p-4 border-2 border-dashed border-gray-300 rounded-lg mb-6 bg-yellow-50">
+                        <div class="flex items-center space-x-3 mb-4">
+                            <input type="text" id="promo-code" name="promo-code" class="flex-1 p-2 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="Enter Promo Code (e.g., SANDHANI10)">
+                            <p id="promo-code-status" class="text-sm font-medium text-gray-600 w-32 text-right"></p>
+                        </div>
+
+                        <div class="space-y-2 text-right">
+                            <p class="flex justify-between font-medium"><span>Subtotal (Before Discount):</span> ${CURRENCY_SYMBOL}<span id="enrollment-price">0.00</span></p>
+                            <p class="flex justify-between font-medium text-red-500 border-b pb-2"><span>Discount:</span> -${CURRENCY_SYMBOL}<span id="enrollment-discount">0.00</span></p>
+                            <p class="flex justify-between text-xl font-extrabold text-primary-art"><span>Total Payable:</span> ${CURRENCY_SYMBOL}<span id="enrollment-total">0.00</span></p>
+                        </div>
+                    </div>
+                    
+                    <button type="submit" class="w-full bg-green-600 text-white font-semibold py-3 rounded-lg hover:bg-green-700 transition duration-300 shadow-lg text-lg">
+                        Confirm Configuration & Mock Payment
+                    </button>
+                    <p id="enrollment-status" class="mt-4 text-center"></p>
+                </form>
+            </div>
+            <div class="bg-gray-50 px-6 py-4 flex justify-end">
+                <button onclick="closeModal('sponsor-enrollment-modal')" class="text-gray-500 hover:text-gray-700 text-sm">Close</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Participant Enrollment Modal -->
+    <div id="enrollment-modal" class="fixed inset-0 z-[101] hidden modal-bg flex items-center justify-center p-4">
+        <div class="bg-white rounded-xl w-full max-w-lg shadow-2xl transform transition-all overflow-hidden">
+            <div class="p-8">
+                <h3 class="text-3xl font-bold text-secondary-dark mb-4">Event Enrollment</h3>
+                <p class="text-xl font-semibold text-primary-art mb-6" id="event-title-display">Event Title</p>
+
+                <p class="text-sm text-red-500 mb-4 font-semibold">NOTE: Enrollment data is saved to your browser's local storage only.</p>
+
+                <div class="mb-6 p-4 border-2 border-dashed border-green-300 rounded-lg bg-green-50 text-center">
+                    <p class="text-lg font-bold text-gray-700">Required Event Fee:</p>
+                    <p class="text-5xl font-extrabold text-primary-art mt-1">
+                        <span id="enrollment-fee-currency">${CURRENCY_SYMBOL}</span><span id="enrollment-fee-display">0</span>
+                    </p>
+                    <p class="text-sm text-gray-600 mt-2">By submitting this form, you acknowledge this fee is due (Mock Payment).</p>
+                </div>
+                
+                <form id="enrollment-form">
+                    <input type="hidden" name="event-id" id="enrollment-event-id">
+                    
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Your Name</label>
+                            <input type="text" name="participant-name" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="John Doe" value="${currentUser?.username || ''}">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                            <input type="email" name="participant-email" required class="w-full p-3 border rounded-lg focus:ring-primary-art focus:border-primary-art" placeholder="john@example.com" value="${currentUser?.username || ''}">
+                        </div>
+                    </div>
+
+                    <button type="submit" class="w-full bg-primary-art text-white font-semibold py-3 mt-6 rounded-lg hover:bg-primary-art/80 transition duration-300 shadow-lg text-lg">
+                        Enroll & Pay ${CURRENCY_SYMBOL}<span id="enrollment-fee-display-button">0</span>
+                    </button>
+                    <p id="enrollment-status" class="mt-4 text-center"></p>
+                </form>
+            </div>
+            <div class="bg-gray-50 px-6 py-4 flex justify-end">
+                <button onclick="closeModal('enrollment-modal')" class="text-gray-500 hover:text-gray-700 text-sm">Close</button>
+            </div>
+        </div>
+    </div>
+    
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="fixed inset-0 bg-white bg-opacity-90 flex items-center justify-center z-[100]">
+        <div class="text-center">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-art mx-auto mb-4"></div>
+            <p class="text-secondary-dark font-medium">Loading configuration from Google Sheet...</p>
+        </div>
+    </div>
+
+    <!-- Header & Navigation -->
+    <header class="sticky top-0 z-50 bg-white shadow-lg">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-20">
+                <!-- Logo/Site Name -->
+                <a href="#home" class="flex items-center space-x-2 text-2xl font-extrabold tracking-tight">
+                    <div id="site-logo" class="w-8 h-8 flex items-center justify-center text-primary-art"></div>
+                    <span class="text-primary-art">Sreejan<span class="text-secondary-dark">Sandhani</span></span>
+                </a>
+
+                <!-- Desktop Navigation and Auth Status -->
+                <div class="flex items-center space-x-4">
+                    <nav class="hidden md:flex space-x-6">
+                        <a href="#our-work" class="text-lg text-secondary-dark hover:text-primary-art transition duration-300">Events</a>
+                        <a href="#sponsorship" class="text-lg text-secondary-dark hover:text-primary-art transition duration-300 font-semibold">Sponsorship</a>
+                    </nav>
+                    
+                    <div id="auth-status" class="flex items-center space-x-2">
+                        <!-- Login/Logout button rendered by JS -->
+                    </div>
+
+                    <button id="admin-toggle" class="bg-primary-art text-white font-medium py-2 px-4 rounded-full text-sm shadow-md hover:bg-primary-art/80 transition hidden">
+                        Admin Mode
+                    </button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Admin Panel (Hidden by Default) -->
+    <section id="admin-panel" class="hidden min-h-screen py-10 px-4 md:px-8 bg-gray-200">
+        <div class="max-w-6xl mx-auto">
+            <div class="flex justify-between items-start mb-6 border-b pb-4">
+                <div>
+                    <h2 class="text-3xl font-extrabold text-secondary-dark">Admin Configuration & Tracking</h2>
+                    <p class="text-sm text-gray-600 mt-1">Active Role (Mock): <span id="admin-role-display" class="font-semibold text-primary-art"></span></p>
+                    <p class="text-sm text-red-500 font-semibold">Changes are saved only to this browser's local storage.</p>
+                </div>
+            </div>
+
+            <!-- Tab Navigation (Tabs hidden if role doesn't have permissions) -->
+            <div class="flex border-b border-gray-300 mb-6 overflow-x-auto">
+                <button onclick="switchAdminTab('core-tab', this)" data-target="core-tab" class="tab-button py-2 px-4 text-gray-500 border-b-2 border-transparent transition duration-200">Event Fee Management</button>
+                <button onclick="switchAdminTab('sponsor-tracking-tab', this)" data-target="sponsor-tracking-tab" class="tab-button py-2 px-4 text-gray-500 border-b-2 border-transparent transition duration-200">Sponsor Tracking</button>
+                <button onclick="switchAdminTab('log-tab', this)" data-target="log-tab" class="tab-button py-2 px-4 text-gray-500 border-b-2 border-transparent transition duration-200">Local Data Log</button>
+            </div>
+
+            <!-- Tab Content -->
+            <div id="admin-tab-content">
+                <!-- Core Content Tab (Event Fee Management) -->
+                <div id="core-tab" class="tab-pane">
+                    <div class="bg-white p-6 rounded-xl shadow-lg border-t-4 border-primary-art">
+                        <h3 class="text-2xl font-bold mb-4 text-primary-art border-b pb-2">Event Fee Management</h3>
+                        <p class="text-sm text-gray-600 mb-6">Only **Founders** can update the required **Event Fee** for all upcoming events here. (Local Change)</p>
+                        
+                        <div id="event-management-content" class="min-h-32">
+                             <!-- Event fee forms rendered by JS: renderEventManagement() -->
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Sponsor Tracking Tab -->
+                <div id="sponsor-tracking-tab" class="tab-pane hidden">
+                    <div class="bg-white p-6 rounded-xl shadow-lg border-t-4 border-primary-art">
+                        <h3 class="text-xl font-bold mb-4 text-primary-art">Sponsor Reach & Metrics Tracking</h3>
+                        <p class="text-sm text-gray-600 mb-6">Update **Physical Metrics** manually below. **Digital Clicks** are tracked locally.</p>
+                        <div id="sponsor-tracking-content" class="min-h-72 space-y-4">
+                            <!-- Sponsor tracking data rendered by JS -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Audit Log Tab (Placeholder) -->
+                <div id="log-tab" class="tab-pane hidden">
+                    <div class="bg-white p-6 rounded-xl shadow-lg border-t-4 border-primary-art">
+                        <h3 class="text-xl font-bold mb-4 text-primary-art">Local Enrollment Log</h3>
+                        <div id="audit-log-content" class="h-96 overflow-y-scroll bg-gray-50 border rounded-lg p-4 text-sm">
+                            <!-- Local log content rendered by JS: switchAdminTab -->
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </section>
+
+
+    <!-- Main Site Content (Visible by Default) -->
+    <main id="main-site-content">
+        <!-- 1. Hero Section -->
+        <section id="home" class="bg-primary-art/90 py-20 md:py-32 text-white overflow-hidden">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+                <h1 class="text-5xl md:text-7xl font-extrabold mb-4 leading-tight drop-shadow-lg">
+                    Sreejan Sandhani: The Quest for Creativity
+                </h1>
+                <p class="text-xl md:text-2xl mb-8 font-light max-w-3xl mx-auto">
+                    We host inspiring art events that engage the community while offering unique, high-visibility partnership opportunities.
+                </p>
+                <button onclick="openSponsorEnrollmentModal()" class="inline-block bg-accent-brush text-secondary-dark font-bold py-3 px-8 rounded-full text-lg shadow-xl hover:bg-white hover:text-primary-art transition duration-300 transform hover:scale-105">
+                    Become a Partner Today
+                </button>
+            </div>
+        </section>
+
+        <!-- 2. Our Events & Impact Section (Upcoming + Past) -->
+        <section id="our-work" class="py-16 md:py-24 bg-light-canvas">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                <h2 class="text-4xl font-bold text-center mb-12 text-secondary-dark">Upcoming Events (Data from Google Sheet)</h2>
+                <div id="upcoming-events-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                    <!-- Events populated by JS -->
+                </div>
+            </div>
+        </section>
+
+        <!-- 3. Sponsorship Pitch Section -->
+        <section id="sponsorship" class="bg-secondary-dark py-16 md:py-24 text-light-canvas">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+                <h2 class="text-4xl font-bold mb-4 text-accent-brush">Sponsor Our Success</h2>
+                <p class="text-lg max-w-2xl mx-auto mb-8">Configure your ad space on drawing books, bags, and event banners for precise reach and pricing.</p>
+                <button onclick="openSponsorEnrollmentModal()" class="inline-block bg-primary-art text-white font-bold py-3 px-8 rounded-full text-lg shadow-xl hover:bg-primary-art/80 transition duration-300 transform hover:scale-105">
+                    Configure & Enroll
+                </button>
+            </div>
+        </section>
+
+        <!-- 4. Digital Ads Section -->
+        <section id="digital-ads" class="bg-light-canvas py-16 md:py-24">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+                <h2 id="ads-title-display" class="text-4xl font-bold mb-8 text-secondary-dark">Our Valued Sponsors (Data saved locally)</h2>
+                <div class="bg-accent-brush/10 p-8 rounded-xl max-w-4xl mx-auto border-4 border-accent-brush shadow-inner">
+                    <div id="digital-sponsors-list" class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-6 justify-center">
+                        <!-- Dynamic Sponsors rendered by JS -->
+                    </div>
+                </div>
+                <p class="text-gray-500 mt-6 text-sm">Every click on a logo is tracked and reported live in the Sponsor Tracking Dashboard (Locally).</p>
+            </div>
+        </section>
+
+
+        <!-- 5. Co-Founders Section -->
+        <section id="founders" class="py-16 md:py-24 bg-light-canvas">
+             <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+                <h2 class="text-4xl font-bold mb-12 text-secondary-dark">Our Founders</h2>
+                <div class="flex flex-wrap justify-center gap-10">
+                    <div class="w-full sm:w-60 bg-white p-6 rounded-xl shadow-lg border-t-4 border-accent-brush">
+                        <img src="https://placehold.co/128x128/ccc/333?text=S+B" alt="Snehasish B" class="w-32 h-32 rounded-full object-cover mx-auto mb-4 border-4 border-primary-art">
+                        <h3 class="text-xl font-bold text-secondary-dark">Snehasish B</h3>
+                        <p class="text-primary-art">Founder</p>
+                    </div>
+                    <div class="w-full sm:w-60 bg-white p-6 rounded-xl shadow-lg border-t-4 border-accent-brush">
+                        <img src="https://placehold.co/128x128/333/ccc?text=S+B" alt="Sangramjit B" class="w-32 h-32 rounded-full object-cover mx-auto mb-4 border-4 border-primary-art">
+                        <h3 class="text-xl font-bold text-secondary-dark">Sangramjit B</h3>
+                        <p class="text-primary-art">Co-Founder</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-secondary-dark/95 text-white py-8">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row justify-between items-center text-sm">
+            <p>&copy; 2025 Sreejan Sandhani. All rights reserved.</p>
+            <div class="flex space-x-4 mt-4 md:mt-0">
+                <a href="#" class="hover:text-primary-art transition">Privacy Policy</a>
+                <a href="#" class="hover:text-primary-art transition">Terms of Service</a>
+            </div>
+        </div>
+    </footer>
+
+</body>
+</html>
